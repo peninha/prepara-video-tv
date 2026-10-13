@@ -10,14 +10,17 @@ Aplicativo local para Windows, pensado para a Samsung UN40NU7100G.
 4. Para um primeiro teste, marque **Gerar apenas amostra dos primeiros 3 minutos**.
 5. Clique em **Preparar para a TV**. Depois use **Abrir resultados**.
 
-Sem pasta de destino definida, cada original recebe uma pasta vizinha `Preparados-TV`. Saídas existentes recebem um novo nome numerado; originais nunca são sobrescritos. Cada vídeo recebe um relatório JSON local. O aplicativo não faz uploads nem downloads.
+A pasta de destino padrão é `C:\Users\Pena\Documents\Torrents\Preparados-TV`, já preenchida ao abrir o programa. Você pode escolher outra pasta; se apagar o campo, o programa usa o destino padrão. Saídas existentes recebem um novo nome numerado; originais nunca são sobrescritos. Cada vídeo recebe um relatório JSON local. O aplicativo não faz uploads nem downloads.
 
 ## O que faz
 
-- Mantém o primeiro vídeo principal, um áudio principal e até duas legendas internas: uma em português e uma em inglês.
-- Prefere legendas completas, português brasileiro identificado nos metadados e inglês sem SDH. Não adivinha o idioma de faixas sem identificação.
+- Mantém o primeiro vídeo principal, um áudio principal e até duas legendas: uma em português e uma em inglês, incorporadas ao MKV.
+- Busca legendas internas e externas em SRT, ASS, SSA ou VTT na pasta do vídeo e nas subpastas `Subs`/`Sub` (incluindo suas pastas por filme ou idioma).
+- Prefere legendas completas, de texto, português brasileiro e inglês sem SDH. Em empate, prefere externas associadas pelo nome do vídeo e depois faixas internas. PT-BR e PT concorrem pela mesma vaga de português.
+- Identifica o idioma externo pelo nome (`pt-BR`, `por`, `Portuguese`, `English`, etc.) ou pela pasta de idioma; se faltar identificação, tenta estimar PT/EN pelo texto usando uma heurística local. O nome do arquivo tem prioridade sobre a pasta. Estimativas e omissões são registradas na análise; textos curtos ou ambíguos podem não ser identificados. Não estima o idioma de faixas internas sem metadados nem distingue PT-BR de PT pelo conteúdo.
+- Quando há vários vídeos na mesma pasta, só incorpora legendas externas cujo caminho contenha o nome do vídeo correspondente; ignora legendas genéricas para evitar associar episódios/filmes errados. Com um único vídeo, também considera nomes genéricos.
 - Você pode preferir o áudio inglês ou português; se faltar, mantém o áudio principal disponível e informa isso.
-- Converte legendas de texto para SRT; estilos de ASS/SSA são perdidos. Legendas em imagem são omitidas com aviso: não há OCR. Arquivos externos de legenda ainda não são importados.
+- Converte legendas de texto para SRT; estilos de ASS/SSA são perdidos. Aceita texto externo em UTF-8, UTF-16 com BOM ou Windows-1252. Legendas em imagem são omitidas com aviso: não há OCR. Não baixa nem traduz legendas.
 - Remove capítulos, anexos e metadados globais na cópia. Idiomas das legendas são identificados na saída.
 - Pode analisar sem criar vídeos, processar lotes, gerar amostras e cancelar. Cópias já concluídas permanecem disponíveis após cancelamento.
 

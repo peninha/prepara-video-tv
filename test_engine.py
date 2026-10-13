@@ -5,7 +5,7 @@ import tempfile
 import threading
 import unittest
 
-from engine import analyze, prepare, probe, tool, Cancelled, NO_WINDOW
+from engine import analyze, prepare, probe, tool, Cancelled, NO_WINDOW, content_language, DEFAULT_OUTPUT_DIR
 
 
 def media(subs=None, **video):
@@ -56,6 +56,63 @@ class SelectionTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_external_subtitles_and_encoding(self):
+        with tempfile.TemporaryDirectory(prefix='prepara-tv-subs-', dir=Path(__file__).parent) as tmp:
+            root = Path(tmp)
+            source = root / 'filme.mp4'
+            subprocess.run([tool('ffmpeg'), '-v', 'error', '-nostdin', '-f', 'lavfi', '-i',
+                            'testsrc2=size=320x180:rate=24', '-t', '3', '-c:v', 'libx264', str(source)],
+                           check=True, creationflags=NO_WINDOW)
+            before = source.read_bytes()
+            (root / 'filme.srt').write_text('1\n00:00:00,100 --> 00:00:02,000\n'
+                                           'You are here with me. I know that this is what you want.\n', encoding='utf-8')
+            subs = root / 'Subs' / 'Portuguese'
+            subs.mkdir(parents=True)
+            (subs / 'filme.pt-BR.srt').write_bytes('1\n00:00:00,100 --> 00:00:02,000\n'
+                                                'Você não está só. Ação e coração.\n'.encode('cp1252'))
+            (subs / 'filme.pt.srt').write_text('1\n00:00:00,100 --> 00:00:02,000\nOutra versão.\n', encoding='utf-8')
+            (root / 'Subs' / '2_English.srt').write_text('1\n00:00:00,100 --> 00:00:02,000\nOther version.\n', encoding='utf-8')
+            plan = analyze(source, probe(source))
+            self.assertEqual(plan.subtitle_languages, ['pt', 'en'])
+            self.assertTrue(plan.subtitle_sources[0]['path'].endswith('filme.pt-BR.srt'))
+            self.assertTrue(plan.subtitle_sources[1]['path'].endswith('filme.srt'))
+            self.assertFalse(plan.convert_video)
+            output = prepare(plan, root / 'out', verify=True)
+            streams = [s for s in probe(output)['streams'] if s['codec_type'] == 'subtitle']
+            self.assertEqual([s['tags']['language'] for s in streams], ['por', 'eng'])
+            pt = subprocess.check_output([tool('ffmpeg'), '-v', 'error', '-i', str(output),
+                                          '-map', '0:s:0', '-f', 'srt', '-'], creationflags=NO_WINDOW).decode('utf-8')
+            self.assertIn('Você não está só. Ação e coração.', pt)
+            en = subprocess.check_output([tool('ffmpeg'), '-v', 'error', '-i', str(output),
+                                          '-map', '0:s:1', '-f', 'srt', '-'], creationflags=NO_WINDOW).decode('utf-8')
+            self.assertIn('You are here with me.', en)
+            self.assertEqual(source.read_bytes(), before)
+
+    def test_internal_and_external_selection_and_ambiguous_folder(self):
+        with tempfile.TemporaryDirectory(prefix='prepara-tv-select-', dir=Path(__file__).parent) as tmp:
+            root = Path(tmp)
+            source = root / 'filme.mp4'
+            source.touch()
+            (root / 'outro.mp4').touch()
+            (root / 'sub').mkdir()
+            text = '1\n00:00:00,100 --> 00:00:02,000\nVocê está aqui.\n'
+            for name in ('filme.pt-BR.srt', 'outro.pt-BR.srt', 'Portuguese.srt', 'filme.forced.pt-BR.srt'):
+                (root / 'sub' / name).write_text(text, encoding='utf-8')
+            data = media([subtitle(2, 'por'), subtitle(3, 'eng')])
+            plan = analyze(source, data)
+            self.assertEqual(plan.subtitle_languages, ['pt', 'en'])
+            self.assertTrue(plan.subtitle_sources[0]['path'].endswith('filme.pt-BR.srt'))
+            self.assertIsNone(plan.subtitle_sources[1]['path'])
+            self.assertEqual(plan.subtitle_sources[1]['index'], 3)
+            self.assertTrue(any('associação ambígua' in note for note in plan.notes))
+
+    def test_language_confidence(self):
+        self.assertEqual(content_language('You are here with me. I know that this is what you want.'), 'en')
+        self.assertEqual(content_language('Você não está aqui comigo. Eu não sei o que você quer, mas vamos para minha casa.'), 'pt')
+        self.assertEqual(content_language('Hola, yo estoy aqui con usted. Muchas gracias pero no tengo eso para ustedes.'), '')
+        self.assertEqual(content_language('OK.'), '')
+        self.assertEqual(str(DEFAULT_OUTPUT_DIR), r'C:\Users\Pena\Documents\Torrents\Preparados-TV')
+
     def test_real_remux_conversion_and_cancel(self):
         # TemporaryDirectory is solely the newly created test workspace.
         with tempfile.TemporaryDirectory(prefix='prepara-tv-test-', dir=Path(__file__).parent) as tmp:

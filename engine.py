@@ -10,11 +10,133 @@ import subprocess
 import threading
 import time
 import uuid
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from fractions import Fraction
+import unicodedata
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 TEXT_SUBS = {'subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
+DEFAULT_OUTPUT_DIR = Path(r'C:\Users\Pena\Documents\Torrents\Preparados-TV')
+VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.m4v', '.ts', '.m2ts', '.webm', '.wmv'}
+SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.vtt'}
+
+
+def normalized(text):
+    return ''.join(c for c in unicodedata.normalize('NFKD', text.casefold())
+                   if not unicodedata.combining(c))
+
+
+def named_language(name):
+    name = normalized(name)
+    patterns = [
+        ('pt-br', r'pt[ ._-]?br|pob|brazil(?:ian)?|brasil(?:eiro)?|brazilian[ ._-]portuguese'),
+        ('pt', r'pt(?:[ ._-]pt)?|por|portugu[eê]s|portuguese'),
+        ('en', r'en(?:[ ._-](?:us|gb))?|eng|english|ingles'),
+        ('other', r'es|spa|spanish|espanol|fr|fre|fra|french|francais|de|deu|ger|german|it|ita|italian|jpn|japanese|arabic|rus|russian'),
+    ]
+    for language, pattern in patterns:
+        if re.search(r'(?<![a-z0-9])(?:' + pattern + r')(?![a-z0-9])', name):
+            return language
+    return ''
+
+
+def read_subtitle(path):
+    with path.open('rb') as f:
+        raw = f.read(8 * 1024 * 1024 + 1)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError('legenda maior que o limite de análise de 8 MB')
+    if raw.startswith((b'\xff\xfe', b'\xfe\xff')):
+        return raw.decode('utf-16'), None  # FFmpeg reconhece o BOM.
+    try:
+        return raw.decode('utf-8-sig'), None
+    except UnicodeDecodeError:
+        return raw.decode('cp1252'), 'CP1252'
+
+
+def content_language(text):
+    # Heurística local: comparar palavras frequentes, incluindo idiomas próximos
+    # para não confundir uma legenda espanhola/francesa com português/inglês.
+    text = re.sub(r'<[^>]*>|\{[^}]*\}', ' ', text)
+    words = re.findall(r'[a-z]+', normalized(text))
+    vocabularies = {
+        'pt': 'nao voce voces que eu uma para com estou esta isso meu minha sim mas por aqui como ele ela nos entao tambem muito obrigado porque tenho vamos foi seu sua',
+        'en': 'the you your i is are was were have has do did dont what that this with for not it we they he she my me yes but can would could should will just from know',
+        'es': 'no yo tu usted ustedes una para con estoy esta eso mi pero aqui como el ella nosotros entonces tambien mucho gracias porque tengo vamos fue su',
+        'fr': 'je tu vous nous ils elles pas une pour avec suis est ca mon mais ici comme alors aussi merci pourquoi avez tres oui',
+        'de': 'ich du sie wir nicht das der die ein eine und ist mit habe aber hier danke ja was',
+        'it': 'io tu voi noi non una per con sono questo mio ma qui come lui lei allora anche grazie molto',
+    }
+    scores = {}
+    for language, vocab in vocabularies.items():
+        vocabulary = set(vocab.split())
+        scores[language] = sum(word in vocabulary for word in words)
+    ranked = sorted(scores, key=scores.get, reverse=True)
+    best, runner_up = ranked[:2]
+    if best in {'pt', 'en'} and scores[best] >= 8 and scores[best] >= 1.7 * max(1, scores[runner_up]):
+        return best
+    return ''
+
+
+def external_subtitles(source, notes):
+    source = Path(source)
+    if not source.is_file():
+        return []
+    try:
+        siblings = list(source.parent.iterdir())
+        videos = [p for p in siblings if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS]
+        files = [p for p in siblings if p.is_file() and p.suffix.lower() in SUBTITLE_EXTENSIONS]
+        for folder in siblings:
+            if folder.is_dir() and folder.name.casefold() in {'subs', 'sub'}:
+                # Não seguir links de diretório; incluir pastas por filme/idioma.
+                for directory, dirs, names in os.walk(folder, followlinks=False):
+                    dirs[:] = sorted(d for d in dirs if not (Path(directory) / d).is_symlink())
+                    files.extend(Path(directory) / name for name in names
+                                 if Path(name).suffix.lower() in SUBTITLE_EXTENSIONS)
+    except OSError as exc:
+        notes.append(f'Não foi possível buscar legendas externas: {exc}')
+        return []
+    result = []
+    for path in sorted(set(files), key=lambda p: str(p).casefold()):
+        relative = str(path.relative_to(source.parent).with_suffix(''))
+        matching = [v for v in videos if normalized(v.stem) in normalized(relative)]
+        owner = max(matching, key=lambda v: len(v.stem), default=None)
+        if (owner is not None and owner != source) or (owner is None and len(videos) != 1):
+            notes.append(f'Legenda externa ignorada por associação ambígua ou de outro vídeo: {relative}.')
+            continue
+        try:
+            text, encoding = read_subtitle(path)
+            # O nome do filme pode conter palavras como "English" ou "It".
+            label = re.sub(re.escape(source.stem), '', relative, flags=re.IGNORECASE)
+            filename_label = re.sub(re.escape(source.stem), '', path.stem, flags=re.IGNORECASE)
+            language = named_language(filename_label)
+            if not language:
+                for parent in reversed(path.relative_to(source.parent).parts[:-1]):
+                    language = named_language(re.sub(re.escape(source.stem), '', parent, flags=re.IGNORECASE))
+                    if language:
+                        break
+            method = 'nome'
+            if not language:
+                language = content_language(text)
+                method = 'texto (estimativa)'
+            if language not in {'pt-br', 'pt', 'en'}:
+                notes.append(f'Legenda externa omitida: {relative} (idioma não identificado com confiança ou fora de PT/EN).')
+                continue
+            data = probe(path)
+            stream = next((s for s in data.get('streams', []) if s.get('codec_type') == 'subtitle'), None)
+            if stream is None or stream.get('codec_name') not in TEXT_SUBS:
+                notes.append(f'Legenda externa sem faixa de texto utilizável: {relative}.')
+                continue
+            candidate = dict(stream)
+            candidate['tags'] = {'language': language, 'title': label}
+            candidate['disposition'] = {'forced': bool(re.search(r'(?i)(?<![a-z])(?:forced|forcada)(?![a-z])', normalized(label)))}
+            candidate['external_path'] = str(path)
+            candidate['encoding'] = encoding
+            candidate['matched_name'] = owner is not None
+            result.append(candidate)
+            notes.append(f'Legenda externa encontrada: {relative}; idioma {language}, identificado pelo {method}.')
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+            notes.append(f'Não foi possível ler a legenda externa {relative}: {exc}')
+    return result
 
 
 class Cancelled(Exception):
@@ -58,6 +180,8 @@ def subtitle_score(s, language):
             s.get('codec_name') in TEXT_SUBS,
             brazil if language == 'pt' else True,
             not any(x in title for x in ('sdh', 'hearing', 'commentary')),
+            bool(s.get('matched_name')),
+            not bool(s.get('external_path')),
             -s['index'])
 
 
@@ -74,6 +198,7 @@ class Plan:
     duration: float
     notes: list[str]
     blockers: list[str]
+    subtitle_sources: list[dict] = field(default_factory=list)
 
 
 def analyze(path, data, mode='auto', audio_preference='original'):
@@ -86,7 +211,10 @@ def analyze(path, data, mode='auto', audio_preference='original'):
     a = max(audios, key=lambda s: (audio_preference != 'original' and lang(s) == audio_preference,
                                   bool(s.get('disposition', {}).get('default')), -s['index']), default=None)
     notes, blockers, chosen, languages = [], [], [], []
-    subs = [s for s in streams if s.get('codec_type') == 'subtitle']
+    internal_subs = [s for s in streams if s.get('codec_type') == 'subtitle']
+    external_subs = external_subtitles(path, notes)
+    subs = internal_subs + external_subs
+    subtitle_sources = []
     for language, label in [('pt', 'português'), ('en', 'inglês')]:
         candidates = [s for s in subs if lang(s) == language]
         if not candidates:
@@ -97,12 +225,16 @@ def analyze(path, data, mode='auto', audio_preference='original'):
             notes.append(f'Legenda em {label} é uma imagem e será omitida (esta versão não faz OCR).')
             continue
         chosen.append(selected['index'])
+        subtitle_sources.append({'path': selected.get('external_path'), 'index': selected['index'],
+                                 'encoding': selected.get('encoding')})
         languages.append(language)
+        origin = selected.get('external_path') or f'faixa interna {selected["index"]}'
+        notes.append(f'Legenda selecionada em {label}: {origin}.')
         if selected.get('codec_name') != 'subrip':
             notes.append(f'Legenda em {label} será simplificada para SRT, sem estilos avançados.')
         if selected.get('disposition', {}).get('forced'):
             notes.append(f'A única legenda selecionada em {label} é parcial/forçada.')
-    notes.append(f'Legendas: {len(subs)} no original → {len(chosen)} na cópia (até uma PT e uma EN).')
+    notes.append(f'Legendas: {len(internal_subs)} internas + {len(external_subs)} externas identificadas → {len(chosen)} na cópia (até uma PT e uma EN).')
     if len(audios) > 1:
         notes.append(f'Áudio: manter apenas a faixa {a["index"]}, idioma {lang(a) or "não identificado"}, de {len(audios)} disponíveis.')
     if not a:
@@ -154,19 +286,31 @@ def analyze(path, data, mode='auto', audio_preference='original'):
     duration = float(data.get('format', {}).get('duration') or v.get('duration') or 0)
     return Plan(str(path), v['index'], a['index'] if a else None, chosen, languages,
                 convert_video, convert_audio, 6 if a and int(a.get('channels') or 2) >= 6 else 2,
-                duration, notes, blockers)
+                duration, notes, blockers, subtitle_sources)
 
 
 def ffmpeg_args(plan, output, progress, seconds=None):
     args = [tool('ffmpeg'), '-hide_banner', '-loglevel', 'warning', '-nostdin', '-n',
             '-i', plan.source]
+    mappings = []
+    sources = plan.subtitle_sources or [{'path': None, 'index': index} for index in plan.subtitles]
+    input_number = 0
+    for source in sources:
+        if source['path']:
+            input_number += 1
+            if source.get('encoding'):
+                args += ['-sub_charenc', source['encoding']]
+            args += ['-i', source['path']]
+            mappings.append(f'{input_number}:{source["index"]}')
+        else:
+            mappings.append(f'0:{source["index"]}')
     if seconds:
         args += ['-t', str(seconds)]
     args += ['-map', f'0:{plan.video}']
     if plan.audio is not None:
         args += ['-map', f'0:{plan.audio}']
-    for index in plan.subtitles:
-        args += ['-map', f'0:{index}']
+    for mapping in mappings:
+        args += ['-map', mapping]
     args += ['-map_metadata', '-1', '-map_chapters', '-1']
     if plan.convert_video:
         args += ['-c:v', 'libx264', '-preset', 'medium', '-crf', '20', '-pix_fmt', 'yuv420p',

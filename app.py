@@ -6,7 +6,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-from engine import analyze, probe, prepare, tool, Cancelled
+from engine import analyze, probe, prepare, tool, Cancelled, DEFAULT_OUTPUT_DIR
 
 
 class App(tk.Tk):
@@ -52,8 +52,8 @@ class App(tk.Tk):
             combo = ttk.Combobox(row, textvariable=var, values=values, state='readonly')
             combo.pack(side='left', fill='x', expand=True)
             self.controls.append(combo)
-        ttk.Label(outer, text='Português brasileiro tem preferência. A seleção depende dos idiomas informados no arquivo.').pack(anchor='w', pady=6)
-        self.destination = tk.StringVar()
+        ttk.Label(outer, text='Busca legendas internas, na pasta do vídeo e em Subs/Sub. Português brasileiro tem preferência.').pack(anchor='w', pady=6)
+        self.destination = tk.StringVar(value=str(DEFAULT_OUTPUT_DIR))
         row = ttk.Frame(outer)
         row.pack(fill='x', pady=5)
         ttk.Label(row, text='Salvar cópias em', width=19).pack(side='left')
@@ -61,7 +61,7 @@ class App(tk.Tk):
         entry.pack(side='left', fill='x', expand=True)
         self.controls.append(entry)
         self.button(row, 'Escolher…', self.choose_folder).pack(side='left', padx=(8, 0))
-        ttk.Label(outer, text='Em branco: cria uma pasta Preparados-TV ao lado de cada original.').pack(anchor='w')
+        ttk.Label(outer, text='Em branco: usa a pasta padrão Torrents\\Preparados-TV.').pack(anchor='w')
         self.sample = tk.BooleanVar(value=False)
         self.verify = tk.BooleanVar(value=False)
         for text, var in [('Gerar apenas amostra dos primeiros 3 minutos', self.sample),
@@ -158,7 +158,7 @@ class App(tk.Tk):
                     plan = analyze(path, probe(path), mode, audio)
                     self.events.put(('log', '\n' + name + '\n' + '\n'.join('• ' + note for note in plan.notes + plan.blockers)))
                     if write:
-                        folder = Path(destination) if destination else Path(path).parent / 'Preparados-TV'
+                        folder = Path(destination) if destination else DEFAULT_OUTPUT_DIR
                         self.events.put(('status', f'{i}/{len(paths)} — Preparando {name}'))
                         output = prepare(plan, folder, self.cancel_event, lambda n: self.events.put(('progress', n)), seconds, verify)
                         self.events.put(('output', str(output.parent)))
