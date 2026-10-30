@@ -16,6 +16,7 @@ import unicodedata
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
 TEXT_SUBS = {'subrip', 'ass', 'ssa', 'mov_text', 'webvtt', 'text'}
+IMAGE_SUBS = {'hdmv_pgs_subtitle', 'dvd_subtitle'}
 DEFAULT_OUTPUT_DIR = Path(r'C:\Users\Pena\Documents\Torrents\Preparados-TV')
 VIDEO_EXTENSIONS = {'.mkv', '.mp4', '.avi', '.mov', '.m4v', '.ts', '.m2ts', '.webm', '.wmv'}
 SUBTITLE_EXTENSIONS = {'.srt', '.ass', '.ssa', '.vtt'}
@@ -220,21 +221,28 @@ def analyze(path, data, mode='auto', audio_preference='original'):
         if not candidates:
             notes.append(f'Não há legenda identificada em {label}; não será criada nem traduzida.')
             continue
-        selected = max(candidates, key=lambda s: subtitle_score(s, language))
-        if selected.get('codec_name') not in TEXT_SUBS:
-            notes.append(f'Legenda em {label} é uma imagem e será omitida (esta versão não faz OCR).')
+        supported = [s for s in candidates if s.get('codec_name') in TEXT_SUBS | IMAGE_SUBS]
+        if not supported:
+            notes.append(f'Não há legenda em {label} com codec suportado; será omitida.')
             continue
-        chosen.append(selected['index'])
-        subtitle_sources.append({'path': selected.get('external_path'), 'index': selected['index'],
-                                 'encoding': selected.get('encoding')})
-        languages.append(language)
-        origin = selected.get('external_path') or f'faixa interna {selected["index"]}'
-        notes.append(f'Legenda selecionada em {label}: {origin}.')
-        if selected.get('codec_name') != 'subrip':
-            notes.append(f'Legenda em {label} será simplificada para SRT, sem estilos avançados.')
-        if selected.get('disposition', {}).get('forced'):
-            notes.append(f'A única legenda selecionada em {label} é parcial/forçada.')
-    notes.append(f'Legendas: {len(internal_subs)} internas + {len(external_subs)} externas identificadas → {len(chosen)} na cópia (até uma PT e uma EN).')
+        ranked = sorted(supported, key=lambda s: subtitle_score(s, language), reverse=True)
+        for selected in (ranked[:1] if language == 'pt' else ranked):
+            chosen.append(selected['index'])
+            subtitle_sources.append({'path': selected.get('external_path'), 'index': selected['index'],
+                                     'encoding': selected.get('encoding'), 'codec': selected.get('codec_name'),
+                                     'title': selected.get('tags', {}).get('title', ''),
+                                     'forced': bool(selected.get('disposition', {}).get('forced')),
+                                     'hearing_impaired': bool(selected.get('disposition', {}).get('hearing_impaired'))})
+            languages.append(language)
+            origin = selected.get('external_path') or f'faixa interna {selected["index"]}'
+            notes.append(f'Legenda selecionada em {label}: {origin}.')
+            if selected.get('codec_name') in IMAGE_SUBS:
+                notes.append(f'Legenda em {label} é uma imagem (PGS/VobSub) e será copiada diretamente para o MKV, sem OCR.')
+            elif selected.get('codec_name') != 'subrip':
+                notes.append(f'Legenda em {label} será simplificada para SRT, sem estilos avançados.')
+            if selected.get('disposition', {}).get('forced'):
+                notes.append(f'Legenda selecionada em {label} ({origin}) é parcial/forçada.')
+    notes.append(f'Legendas: {len(internal_subs)} internas + {len(external_subs)} externas identificadas → {len(chosen)} na cópia (até uma PT e todas as EN suportadas).')
     if len(audios) > 1:
         notes.append(f'Áudio: manter apenas a faixa {a["index"]}, idioma {lang(a) or "não identificado"}, de {len(audios)} disponíveis.')
     if not a:
@@ -323,11 +331,16 @@ def ffmpeg_args(plan, output, progress, seconds=None):
         args += ['-c:a', 'ac3', '-b:a', '448k', '-ar', '48000', '-ac', str(plan.channels)]
     else:
         args += ['-c:a', 'copy']
-    args += ['-c:s', 'srt']
+    for i, source in enumerate(sources):
+        args += [f'-c:s:{i}', 'copy' if source.get('codec') in IMAGE_SUBS else 'srt']
     for i, language in enumerate(plan.subtitle_languages):
+        source = sources[i]
+        title = source.get('title') or ('Portugues' if language == 'pt' else 'English')
+        disposition = (['default'] if i == 0 else [])
+        disposition += [flag for flag in ('forced', 'hearing_impaired') if source.get(flag)]
         args += [f'-metadata:s:s:{i}', 'language=' + ('por' if language == 'pt' else 'eng'),
-                 f'-metadata:s:s:{i}', 'title=' + ('Portugues' if language == 'pt' else 'English'),
-                 f'-disposition:s:{i}', 'default' if i == 0 else '0']
+                 f'-metadata:s:s:{i}', 'title=' + title,
+                 f'-disposition:s:{i}', '+'.join(disposition) or '0']
     args += ['-progress', str(progress), '-nostats', str(output)]
     return args
 

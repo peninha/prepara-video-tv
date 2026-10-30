@@ -32,7 +32,7 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=24)
         outer.pack(fill='both', expand=True)
         ttk.Label(outer, text='Seus vídeos, prontos para a TV', style='Title.TLabel').pack(anchor='w')
-        ttk.Label(outer, text='Samsung NU7100  •  Até uma legenda PT e uma EN  •  Originais preservados').pack(anchor='w', pady=(6, 18))
+        ttk.Label(outer, text='Samsung NU7100  •  Até uma legenda PT e todas as EN  •  Originais preservados').pack(anchor='w', pady=(6, 18))
         row = ttk.Frame(outer)
         row.pack(fill='x')
         self.button(row, 'Adicionar vídeos…', self.add_files).pack(side='left')

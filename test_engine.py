@@ -1,11 +1,13 @@
 import json
 from pathlib import Path
 import subprocess
+import struct
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
-from engine import analyze, prepare, probe, tool, Cancelled, NO_WINDOW, content_language, DEFAULT_OUTPUT_DIR
+from engine import analyze, prepare, probe, tool, Cancelled, NO_WINDOW, content_language, DEFAULT_OUTPUT_DIR, ffmpeg_args
 
 
 def media(subs=None, **video):
@@ -26,7 +28,7 @@ class SelectionTests(unittest.TestCase):
         data = media([subtitle(2, 'por', 'Portuguese'), subtitle(3, 'eng', 'SDH'),
                       subtitle(4, 'por', 'Portuguese (Brazil)'), subtitle(5, 'eng'), subtitle(6, 'spa')])
         plan = analyze('video.mkv', data)
-        self.assertEqual(plan.subtitles, [4, 5])
+        self.assertEqual(plan.subtitles, [4, 5, 3])
         self.assertFalse(plan.convert_video)
         self.assertFalse(plan.convert_audio)
 
@@ -34,10 +36,46 @@ class SelectionTests(unittest.TestCase):
         plan = analyze('video.mkv', media([subtitle(2, 'pt-br', forced=1), subtitle(3, 'por')]))
         self.assertEqual(plan.subtitles, [3])
 
-    def test_no_guessed_languages_or_image_conversion(self):
+    def test_no_guessed_languages_but_keep_images(self):
         plan = analyze('video.mkv', media([subtitle(2, 'und'), subtitle(3, 'eng', codec='hdmv_pgs_subtitle')]))
-        self.assertEqual(plan.subtitles, [])
-        self.assertTrue(any('imagem' in n for n in plan.notes))
+        self.assertEqual(plan.subtitles, [3])
+        self.assertTrue(any('copiada diretamente' in n for n in plan.notes))
+        self.assertFalse(any('simplificada' in n for n in plan.notes))
+
+    def test_mixed_codecs_all_english_and_only_one_portuguese(self):
+        for pt_codec, en_codec in [('hdmv_pgs_subtitle', 'dvd_subtitle'), ('dvd_subtitle', 'hdmv_pgs_subtitle')]:
+            with self.subTest(pt_codec=pt_codec):
+                data = media([subtitle(2, 'por', codec=pt_codec), subtitle(3, 'pt-br', forced=1),
+                              subtitle(4, 'eng', 'English SDH', codec=en_codec),
+                              subtitle(5, 'en', 'English full'),
+                              subtitle(6, 'eng', 'English forced', forced=1, codec=en_codec),
+                              subtitle(7, 'spa', codec=pt_codec), subtitle(8, 'und', codec=en_codec)])
+                data['streams'][4]['disposition']['hearing_impaired'] = 1
+                plan = analyze('video.mkv', data, mode='copy')
+                self.assertEqual(plan.subtitles, [2, 5, 4, 6])
+                self.assertEqual(plan.subtitle_languages, ['pt', 'en', 'en', 'en'])
+                with patch('engine.tool', return_value='ffmpeg'):
+                    args = ffmpeg_args(plan, 'out.mkv', 'progress.txt')
+                for option in ('-c:v', '-c:a', '-c:s:0', '-c:s:2', '-c:s:3'):
+                    self.assertEqual(args[args.index(option) + 1], 'copy')
+                self.assertEqual(args[args.index('-c:s:1') + 1], 'srt')
+                self.assertEqual(args[args.index('-disposition:s:2') + 1], 'hearing_impaired')
+                self.assertEqual(args[args.index('-disposition:s:3') + 1], 'forced')
+                self.assertIn('title=English SDH', args)
+                self.assertEqual([args[i+1] for i, value in enumerate(args) if value == '-map'],
+                                 ['0:0', '0:1', '0:2', '0:5', '0:4', '0:6'])
+
+    def test_unsupported_codec_does_not_hide_supported_forced_track(self):
+        plan = analyze('video.mkv', media([subtitle(2, 'por', codec='unknown'),
+                                         subtitle(3, 'por', forced=1, codec='dvd_subtitle')]))
+        self.assertEqual(plan.subtitles, [3])
+
+    def test_copy_mode_keeps_nonstandard_video_and_audio(self):
+        data = media([subtitle(2, 'eng', codec='hdmv_pgs_subtitle')], codec_name='av1')
+        data['streams'][1]['codec_name'] = 'dts'
+        plan = analyze('video.mkv', data, mode='copy')
+        self.assertFalse(plan.convert_video)
+        self.assertFalse(plan.convert_audio)
 
     def test_hevc_main10_level5_is_kept(self):
         plan = analyze('video.mkv', media(codec_name='hevc', pix_fmt='yuv420p10le', profile='Main 10', level=150, width=2160, height=1080))
@@ -56,6 +94,63 @@ class SelectionTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
+    def test_real_pgs_and_vobsub_copy(self):
+        with tempfile.TemporaryDirectory(prefix='prepara-tv-image-', dir=Path(__file__).parent) as tmp:
+            root = Path(tmp)
+            # Synthetic 8x8 white bitmap, visible from 0.1 to 2 seconds.
+            def segment(pts, kind, payload=b''):
+                return b'PG' + struct.pack('>IIBH', pts, 0, kind, len(payload)) + payload
+            def composition(number, count):
+                return struct.pack('>HHBHBBBB', 320, 180, 0x10, number, 0x80 if number == 0 else 0,
+                                   0, 0, count)
+            rle = (bytes([1]) * 8 + b'\x00\x00') * 8
+            sup = root / 'bitmap.sup'
+            sup.write_bytes(
+                segment(9000, 0x16, composition(0, 1) + struct.pack('>HBBHH', 0, 0, 0, 100, 100)) +
+                segment(9000, 0x17, struct.pack('>BBHHHH', 1, 0, 100, 100, 8, 8)) +
+                segment(9000, 0x14, bytes([0, 0, 0, 16, 128, 128, 0, 1, 235, 128, 128, 255])) +
+                segment(9000, 0x15, struct.pack('>HBB', 0, 0, 0xc0) + (4 + len(rle)).to_bytes(3, 'big') +
+                        struct.pack('>HH', 8, 8) + rle) + segment(9000, 0x80) +
+                segment(180000, 0x16, composition(1, 0)) + segment(180000, 0x80))
+            source = root / 'images.mkv'
+            subprocess.run([tool('ffmpeg'), '-v', 'error', '-nostdin',
+                            '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24',
+                            '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000', '-i', str(sup),
+                            '-t', '3', '-map', '0:v', '-map', '1:a',
+                            '-map', '2:s', '-map', '2:s', '-map', '2:s', '-map', '2:s', '-map', '2:s',
+                            '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-c:a', 'eac3', '-c:s', 'copy',
+                            '-c:s:1', 'dvdsub', '-c:s:3', 'dvdsub',
+                            '-metadata:s:s:0', 'language=por', '-metadata:s:s:1', 'language=eng',
+                            '-metadata:s:s:1', 'title=English SDH', '-disposition:s:1', 'hearing_impaired',
+                            '-metadata:s:s:2', 'language=eng', '-metadata:s:s:2', 'title=English full',
+                            '-metadata:s:s:3', 'language=por', '-disposition:s:3', 'forced',
+                            '-metadata:s:s:4', 'language=eng', '-metadata:s:s:4', 'title=English forced',
+                            '-disposition:s:4', 'forced', str(source)], check=True, creationflags=NO_WINDOW)
+            before = source.read_bytes()
+            plan = analyze(source, probe(source), mode='copy')
+            self.assertEqual(plan.subtitles, [2, 4, 3, 6])
+            output = prepare(plan, root / 'out', verify=True)
+            streams = probe(output)['streams']
+            subs = [s for s in streams if s['codec_type'] == 'subtitle']
+            self.assertEqual([s['codec_name'] for s in subs],
+                             ['hdmv_pgs_subtitle', 'hdmv_pgs_subtitle', 'dvd_subtitle', 'hdmv_pgs_subtitle'])
+            self.assertEqual([s['tags']['language'] for s in subs], ['por', 'eng', 'eng', 'eng'])
+            self.assertEqual(subs[1]['tags']['title'], 'English full')
+            self.assertEqual(subs[2]['disposition']['hearing_impaired'], 1)
+            self.assertEqual(subs[3]['disposition']['forced'], 1)
+            def packet_hashes(path, index):
+                raw = subprocess.check_output([tool('ffprobe'), '-v', 'error', '-select_streams', str(index),
+                                               '-show_packets', '-show_data_hash', 'sha256',
+                                               '-show_entries', 'packet=data_hash', '-of', 'json', str(path)],
+                                              creationflags=NO_WINDOW)
+                return [p['data_hash'] for p in json.loads(raw)['packets']]
+            # Verify compressed audio/video and every selected bitmap packet byte-for-byte.
+            for original, copied in zip([plan.video, plan.audio, *plan.subtitles], streams):
+                expected = packet_hashes(source, original)
+                self.assertTrue(expected)
+                self.assertEqual(expected, packet_hashes(output, copied['index']))
+            self.assertEqual(source.read_bytes(), before)
+
     def test_external_subtitles_and_encoding(self):
         with tempfile.TemporaryDirectory(prefix='prepara-tv-subs-', dir=Path(__file__).parent) as tmp:
             root = Path(tmp)
@@ -73,13 +168,13 @@ class IntegrationTests(unittest.TestCase):
             (subs / 'filme.pt.srt').write_text('1\n00:00:00,100 --> 00:00:02,000\nOutra versão.\n', encoding='utf-8')
             (root / 'Subs' / '2_English.srt').write_text('1\n00:00:00,100 --> 00:00:02,000\nOther version.\n', encoding='utf-8')
             plan = analyze(source, probe(source))
-            self.assertEqual(plan.subtitle_languages, ['pt', 'en'])
+            self.assertEqual(plan.subtitle_languages, ['pt', 'en', 'en'])
             self.assertTrue(plan.subtitle_sources[0]['path'].endswith('filme.pt-BR.srt'))
             self.assertTrue(plan.subtitle_sources[1]['path'].endswith('filme.srt'))
             self.assertFalse(plan.convert_video)
             output = prepare(plan, root / 'out', verify=True)
             streams = [s for s in probe(output)['streams'] if s['codec_type'] == 'subtitle']
-            self.assertEqual([s['tags']['language'] for s in streams], ['por', 'eng'])
+            self.assertEqual([s['tags']['language'] for s in streams], ['por', 'eng', 'eng'])
             pt = subprocess.check_output([tool('ffmpeg'), '-v', 'error', '-i', str(output),
                                           '-map', '0:s:0', '-f', 'srt', '-'], creationflags=NO_WINDOW).decode('utf-8')
             self.assertIn('Você não está só. Ação e coração.', pt)
